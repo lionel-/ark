@@ -101,7 +101,7 @@ impl<T> Drop for RThreadSafe<T> {
             // is an `RObject`) so it must be called on the main R thread. By using
             // `send_idle_without_capture()`, it is asynchronously dropped at the next
             // idle top-level prompt. We use the `send_idle_without_capture()` variant to
-            // avoid the overhead of `send_idle()`'s `pin_with_capture()`, because this
+            // avoid the overhead of `pin_with_capture()`, because this
             // runs quite often and we know we don't need to capture output.
             drop(shelter);
         }))

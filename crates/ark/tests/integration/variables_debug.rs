@@ -19,7 +19,7 @@ fn test_variables_pane_shows_debug_env() {
     frontend.execute_request_invisibly("test_gv <- 'hello'");
 
     // Open the variables comm and receive the initial Refresh
-    let initial = frontend.open_variables_comm();
+    let (_, initial) = frontend.open_variables_comm();
     let names: Vec<&str> = initial
         .variables
         .iter()
@@ -34,11 +34,11 @@ fn test_variables_pane_shows_debug_env() {
     );
     frontend.recv_iopub_busy();
     frontend.recv_iopub_execute_input();
-    frontend.recv_iopub_idle();
-    frontend.recv_shell_execute_reply();
 
     // The variables pane should have sent a Refresh with the debug env
     let refresh = frontend.recv_variables_refresh();
+    frontend.recv_iopub_idle();
+    frontend.recv_shell_execute_reply();
     let names: Vec<&str> = refresh
         .variables
         .iter()
@@ -50,11 +50,11 @@ fn test_variables_pane_shows_debug_env() {
     frontend.send_execute_request("Q", ExecuteRequestOptions::default());
     frontend.recv_iopub_busy();
     frontend.recv_iopub_execute_input();
-    frontend.recv_iopub_idle();
-    frontend.recv_shell_execute_reply();
 
     // Should be back to showing the global environment
     let refresh = frontend.recv_variables_refresh();
+    frontend.recv_iopub_idle();
+    frontend.recv_shell_execute_reply();
     let names: Vec<&str> = refresh
         .variables
         .iter()
@@ -67,11 +67,9 @@ fn test_variables_pane_shows_debug_env() {
     frontend.send_execute_request("rm(test_gv)", ExecuteRequestOptions::default());
     frontend.recv_iopub_busy();
     frontend.recv_iopub_execute_input();
+    let _update = frontend.recv_variables_update();
     frontend.recv_iopub_idle();
     frontend.recv_shell_execute_reply();
-
-    // Consume the Update triggered by the rm()
-    let _update = frontend.recv_variables_update();
 }
 
 /// When entering debug via a function call, the variables pane should show
@@ -92,11 +90,11 @@ fn test_variables_pane_shows_function_debug_env() {
     );
     frontend.recv_iopub_busy();
     frontend.recv_iopub_execute_input();
-    frontend.recv_iopub_idle();
-    frontend.recv_shell_execute_reply();
 
     // The debug env should show `my_arg`
     let refresh = frontend.recv_variables_refresh();
+    frontend.recv_iopub_idle();
+    frontend.recv_shell_execute_reply();
     let names: Vec<&str> = refresh
         .variables
         .iter()
@@ -108,11 +106,11 @@ fn test_variables_pane_shows_function_debug_env() {
     frontend.send_execute_request("Q", ExecuteRequestOptions::default());
     frontend.recv_iopub_busy();
     frontend.recv_iopub_execute_input();
-    frontend.recv_iopub_idle();
-    frontend.recv_shell_execute_reply();
 
     // Should be back to showing the global environment
     let refresh = frontend.recv_variables_refresh();
+    frontend.recv_iopub_idle();
+    frontend.recv_shell_execute_reply();
     let names: Vec<&str> = refresh
         .variables
         .iter()
@@ -125,11 +123,9 @@ fn test_variables_pane_shows_function_debug_env() {
     frontend.send_execute_request("rm(test_gv2, f)", ExecuteRequestOptions::default());
     frontend.recv_iopub_busy();
     frontend.recv_iopub_execute_input();
+    let _update = frontend.recv_variables_update();
     frontend.recv_iopub_idle();
     frontend.recv_shell_execute_reply();
-
-    // Consume the Update triggered by the rm()
-    let _update = frontend.recv_variables_update();
 }
 
 /// When selecting a different stack frame via DAP, the variables pane should
@@ -184,19 +180,22 @@ fn test_variables_pane_refreshes_on_frame_selection() {
     assert_eq!(names, vec!["outer_var"]);
 
     // Clean exit
-    frontend.debug_send_quit();
+    frontend.send_execute_request("Q", ExecuteRequestOptions::default());
+    frontend.recv_iopub_busy();
+    frontend.recv_iopub_execute_input();
+    frontend.recv_iopub_stop_debug();
     dap.recv_continued();
 
     // Consume the refresh back to global env
     let _refresh = frontend.recv_variables_refresh();
+    frontend.recv_iopub_idle();
+    frontend.recv_shell_execute_reply();
 
     // Clean up
     frontend.send_execute_request("rm(outer, inner)", ExecuteRequestOptions::default());
     frontend.recv_iopub_busy();
     frontend.recv_iopub_execute_input();
+    let _update = frontend.recv_variables_update();
     frontend.recv_iopub_idle();
     frontend.recv_shell_execute_reply();
-
-    // Consume the Update triggered by the rm()
-    let _update = frontend.recv_variables_update();
 }

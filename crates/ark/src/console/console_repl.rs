@@ -1465,7 +1465,6 @@ impl Console {
         // unblocks Shell (which sends Idle). This ensures side effects like
         // data explorer updates and closes arrive within the Busy/Idle
         // window of the execute request that caused them.
-        EVENTS.environment_changed.emit(());
         self.comm_notify_environment_changed(&EnvironmentChanged::Execution {
             input_prompt: input_prompt.to_string(),
             continuation_prompt: continuation_prompt.to_string(),
@@ -2114,9 +2113,11 @@ impl Console {
                 comm_id,
                 comm_name,
                 outgoing_tx,
-                handler,
+                new_handler,
+                data,
                 done_tx,
             } => {
+                let handler = new_handler(data);
                 self.comm_open_frontend(comm_id, &comm_name, outgoing_tx, handler);
                 done_tx.send(()).log_err();
             },
@@ -2634,7 +2635,6 @@ impl Console {
 
         // Signal listeners (e.g. the Variables pane) that they can update state
         if frame_id.is_some() {
-            EVENTS.environment_changed.emit(());
             self.comm_notify_environment_changed(&EnvironmentChanged::FrameSelected);
         }
     }

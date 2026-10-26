@@ -152,7 +152,6 @@ use crate::dap::Dap;
 use crate::help::message::HelpEvent;
 use crate::help::r_help::HelpPorts;
 use crate::help::r_help::RHelp;
-use crate::lsp::events::EVENTS;
 use crate::lsp::main_loop::DidCloseVirtualDocumentParams;
 use crate::lsp::main_loop::DidOpenVirtualDocumentParams;
 use crate::lsp::main_loop::Event;

@@ -17,10 +17,7 @@ use amalthea::comm::variables_comm::VariableList;
 use amalthea::comm::variables_comm::VariablesBackendReply;
 use amalthea::comm::variables_comm::VariablesBackendRequest;
 use amalthea::comm::variables_comm::VariablesFrontendEvent;
-use amalthea::socket::comm::CommSocket;
 use anyhow::anyhow;
-use crossbeam::channel::select;
-use crossbeam::channel::unbounded;
 use harp::environment::Binding;
 use harp::environment::Environment;
 use harp::environment::EnvironmentFilter;
@@ -39,8 +36,11 @@ use libr::R_GlobalEnv;
 use libr::Rf_ScalarLogical;
 use libr::ENVSXP;
 use stdext::result::ResultExt;
-use stdext::spawn;
 
+use crate::comm_handler::handle_rpc_request;
+use crate::comm_handler::CommHandler;
+use crate::comm_handler::CommHandlerContext;
+use crate::comm_handler::EnvironmentChanged;
 use crate::console;
 use crate::console::Console;
 use crate::data_explorer::r_data_explorer::DataExplorerMode;
@@ -48,13 +48,9 @@ use crate::data_explorer::r_data_explorer::DataObjectEnvInfo;
 use crate::data_explorer::r_data_explorer::RDataExplorer;
 use crate::data_explorer::r_data_explorer::DATA_EXPLORER_COMM_NAME;
 use crate::data_explorer::summary_stats::summary_stats;
-use crate::lsp::events::EVENTS;
 use crate::object_explorer::r_object_explorer::path_accessor;
 use crate::object_explorer::r_object_explorer::RObjectExplorer;
 use crate::object_explorer::r_object_explorer::OBJECT_EXPLORER_COMM_NAME;
-use crate::r_task;
-use crate::r_task::RTask;
-use crate::thread::RThreadSafe;
 use crate::variables::variable::is_explorable;
 use crate::variables::variable::is_viewable_character;
 use crate::variables::variable::try_dispatch_view;
@@ -66,23 +62,8 @@ use crate::view::view;
  * responsible for creating and updating the list of variables.
  */
 pub struct RVariables {
-    comm: CommSocket,
-    pub env: RThreadSafe<RObject>,
-    /// `Binding` does not currently protect anything, and therefore doesn't
-    /// implement `Drop`, which might use the R API. It assumes that R SYMSXPs
-    /// protect themselves, and that the binding value is protected by the
-    /// `env`. This seems to work fine, so technically we don't need
-    /// `RThreadSafe` to ensure that the `drop()` runs on the R main thread.
-    /// However, we do need to `Send` the underlying `SEXP` values between
-    /// threads, so we still use `RThreadSafe` for that.
-    ///
-    /// NOTE: What if the bindings get out of sync with the environment?
-    /// Outside of R tasks, R will run concurrently with the environment
-    /// thread and the bindings might be updated concurrently. There is a risk
-    /// that the thread is then holding onto dangling pointers. For safety we
-    /// should probably store the bindings in a list owned by the environment
-    /// thread. Tracked in https://github.com/posit-dev/positron/issues/1812
-    current_bindings: RThreadSafe<Vec<Binding>>,
+    pub env: RObject,
+    current_bindings: Vec<Binding>,
     version: u64,
 
     /// Whether we need to send an initial `Refresh` event to the frontend,
@@ -91,14 +72,18 @@ pub struct RVariables {
     needs_initial_refresh: bool,
 }
 
+impl std::fmt::Debug for RVariables {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RVariables")
+            .field("env", &self.env)
+            .field("version", &self.version)
+            .finish_non_exhaustive()
+    }
+}
+
 impl RVariables {
-    /**
-     * Creates a new RVariables instance.
-     *
-     * - `env`: An R environment to scan for variables, typically R_GlobalEnv
-     * - `comm`: A channel used to send messages to the frontend
-     */
-    pub fn start(env: RObject, comm: CommSocket) {
+    /// Create a variables handler on the R thread.
+    pub fn new(env: RObject) -> Self {
         // Validate that the RObject we were passed is actually an environment
         if let Err(err) = r_assert_type(env.sexp, &[ENVSXP]) {
             log::warn!(
@@ -106,106 +91,15 @@ impl RVariables {
             );
         }
 
-        // To be able to `Send` the `env` to the thread, it needs to be made
-        // thread safe. To create `current_bindings`, we need to be on the main
-        // R thread.
-        let env = RThreadSafe::new(env);
-        let current_bindings = RThreadSafe::new(vec![]);
-
-        // Start the execution thread and wait for requests from the frontend
-        spawn!("ark-variables", move || {
-            // When `env` and `current_bindings` are dropped, a `r_async_task()`
-            // call unprotects them
-            let environment = Self {
-                comm,
-                env,
-                current_bindings,
-                version: 0,
-                needs_initial_refresh: true,
-            };
-            environment.execution_thread();
-        });
-    }
-
-    pub fn execution_thread(mut self) {
-        let (prompt_signal_tx, prompt_signal_rx) = unbounded::<()>();
-
-        // Schedule the initial environment scan as an idle task. If R is
-        // already idle this runs promptly, otherwise it runs at next idle.
-        // This and the prompt-driven `update()` may arrive in either order,
-        // which is safe: the first sends a `Refresh`, the second is a no-op.
-        let initial_signal_tx = prompt_signal_tx.clone();
-        r_task::spawn(RTask::send_idle(async move |_| {
-            initial_signal_tx.send(()).log_err();
-        }));
-
-        // Register a handler for environment change events
-        let listen_id = EVENTS.environment_changed.listen({
-            move |_| {
-                log::info!("Got environment changed signal.");
-                prompt_signal_tx.send(()).log_err();
-            }
-        });
-
-        // Flag initially set to false, but set to true if the user closes the
-        // channel (i.e. the frontend is closed)
-        let mut user_initiated_close = false;
-
-        // Main message processing loop; we wait here for messages from the
-        // frontend and loop as long as the channel is open
-        loop {
-            select! {
-                recv(&prompt_signal_rx) -> msg => {
-                    if let Ok(()) = msg {
-                        self.update();
-                    }
-                },
-
-                recv(&self.comm.incoming_rx) -> msg => {
-                    let msg = match msg {
-                        Ok(msg) => msg,
-                        Err(err) => {
-                            // We failed to receive a message from the frontend. This
-                            // is usually not a transient issue and indicates that the
-                            // channel is closed, so allowing the thread to exit is
-                            // appropriate. Retrying is likely to just lead to a busy
-                            // loop.
-                            log::error!(
-                                "Variables: Error receiving message from frontend: {err:?}"
-                            );
-
-                            break;
-                        },
-                    };
-                    log::info!("Variables: Received message from frontend: {msg:?}");
-
-                    // Break out of the loop if the frontend has closed the channel
-                    if let CommMsg::Close = msg {
-                        log::info!("Variables: Closing down after receiving comm_close from frontend.");
-
-                        // Remember that the user initiated the close so that we can
-                        // avoid sending a duplicate close message from the back end
-                        user_initiated_close = true;
-                        break;
-                    }
-
-                    let comm = self.comm.clone();
-                    comm.handle_request(msg, |req| self.handle_rpc(req));
-                }
-            }
-        }
-
-        EVENTS.environment_changed.remove(listen_id);
-
-        if !user_initiated_close {
-            // Send a close message to the frontend if the frontend didn't
-            // initiate the close
-            self.comm.outgoing_tx.send(CommMsg::Close).unwrap();
+        Self {
+            env,
+            current_bindings: vec![],
+            version: 0,
+            needs_initial_refresh: true,
         }
     }
 
-    fn update_bindings(&mut self, new_bindings: RThreadSafe<Vec<Binding>>) -> u64 {
-        // Updating will `drop()` the old `current_bindings` on the main R thread
+    fn update_bindings(&mut self, new_bindings: Vec<Binding>) -> u64 {
         self.current_bindings = new_bindings;
         self.version += 1;
 
@@ -215,11 +109,9 @@ impl RVariables {
     #[tracing::instrument(level = "trace", skip_all)]
     fn list_variables(&mut self) -> Vec<Variable> {
         let mut variables: Vec<Variable> = vec![];
-        r_task(|| {
-            for binding in self.current_bindings.get() {
-                variables.push(PositronVariable::new(binding).var());
-            }
-        });
+        for binding in &self.current_bindings {
+            variables.push(PositronVariable::new(binding).var());
+        }
 
         variables
     }
@@ -227,6 +119,7 @@ impl RVariables {
     fn handle_rpc(
         &mut self,
         req: VariablesBackendRequest,
+        ctx: &CommHandlerContext,
     ) -> anyhow::Result<VariablesBackendReply> {
         match req {
             VariablesBackendRequest::List => {
@@ -240,7 +133,7 @@ impl RVariables {
             },
             VariablesBackendRequest::Clear(params) => {
                 self.clear(params.include_hidden_objects)?;
-                self.update();
+                self.update(ctx);
                 Ok(VariablesBackendReply::ClearReply())
             },
             VariablesBackendRequest::Delete(params) => {
@@ -276,8 +169,8 @@ impl RVariables {
      * Clear the environment. Uses rm(envir = <env>, list = ls(<env>, all.names = TRUE))
      */
     fn clear(&mut self, include_hidden_objects: bool) -> Result<(), harp::error::Error> {
-        r_task(|| unsafe {
-            let env = self.env.get().clone();
+        unsafe {
+            let env = self.env.clone();
 
             let mut list = RFunction::new("base", "ls")
                 .param("envir", *env)
@@ -297,26 +190,24 @@ impl RVariables {
                 .call()?;
 
             Ok(())
-        })
+        }
     }
 
     /**
      * Clear the environment. Uses rm(envir = <env>, list = ls(<env>, all.names = TRUE))
      */
     fn delete(&mut self, variables: Vec<String>) -> Result<(), harp::error::Error> {
-        r_task(|| {
-            let variables: Vec<&str> = variables.iter().map(|s| s as &str).collect();
+        let variables: Vec<&str> = variables.iter().map(|s| s as &str).collect();
 
-            let env = self.env.get().clone();
+        let env = self.env.clone();
 
-            let result = RFunction::new("base", "rm")
-                .param("list", CharacterVector::create(variables))
-                .param("envir", env)
-                .call();
+        let result = RFunction::new("base", "rm")
+            .param("list", CharacterVector::create(variables))
+            .param("envir", env)
+            .call();
 
-            result?;
-            Ok(())
-        })
+        result?;
+        Ok(())
     }
 
     fn clipboard_format(
@@ -324,17 +215,13 @@ impl RVariables {
         path: &[String],
         format: ClipboardFormatFormat,
     ) -> anyhow::Result<String> {
-        r_task(|| {
-            let env = self.env.get().clone();
-            PositronVariable::clip(env, path, &format)
-        })
+        let env = self.env.clone();
+        PositronVariable::clip(env, path, &format)
     }
 
     fn inspect(&mut self, path: &[String]) -> anyhow::Result<Vec<Variable>> {
-        r_task(|| {
-            let env = self.env.get().clone();
-            PositronVariable::inspect(env, path)
-        })
+        let env = self.env.clone();
+        PositronVariable::inspect(env, path)
     }
 
     /// Open a data viewer for the given variable.
@@ -343,42 +230,37 @@ impl RVariables {
     ///
     /// Returns the ID of the comm managing the view, if any.
     fn view(&mut self, path: &[String]) -> Result<Option<String>, harp::error::Error> {
-        r_task(|| {
-            let env = self.env.get().clone();
-            let obj = PositronVariable::resolve_data_object(env.clone(), path)?;
+        let env = self.env.clone();
+        let obj = PositronVariable::resolve_data_object(env.clone(), path)?;
 
-            // Try custom view method first (e.g., for connections)
-            if try_dispatch_view(obj.sexp).map_err(harp::Error::Anyhow)? {
-                return Ok(None);
-            }
+        // Try custom view method first (e.g., for connections)
+        if try_dispatch_view(obj.sexp).map_err(harp::Error::Anyhow)? {
+            return Ok(None);
+        }
 
-            // Functions and single strings open in an editor
-            if r_is_function(obj.sexp) ||
-                (is_viewable_character(obj.sexp) && r_length(obj.sexp) == 1)
-            {
-                harp::as_result(view(&obj, path, &env))?;
-                return Ok(None);
-            }
+        // Functions and single strings open in an editor
+        if r_is_function(obj.sexp) || (is_viewable_character(obj.sexp) && r_length(obj.sexp) == 1) {
+            harp::as_result(view(&obj, path, &env))?;
+            return Ok(None);
+        }
 
-            if is_explorable(obj.sexp) {
-                return self.view_object(obj, path, env).map(Some);
-            }
+        if is_explorable(obj.sexp) {
+            return self.view_object(obj, path, env).map(Some);
+        }
 
-            let name = unsafe { path.get_unchecked(path.len() - 1) };
+        let name = unsafe { path.get_unchecked(path.len() - 1) };
 
-            let binding = DataObjectEnvInfo {
-                name: name.to_string(),
-                env,
-            };
+        let binding = DataObjectEnvInfo {
+            name: name.to_string(),
+            env,
+        };
 
-            let explorer =
-                RDataExplorer::new(name.clone(), obj, Some(binding), DataExplorerMode::Full)
-                    .map_err(harp::Error::Anyhow)?;
-            let viewer_id = Console::get_mut()
-                .comm_open_backend(DATA_EXPLORER_COMM_NAME, Box::new(explorer))
-                .map_err(harp::Error::Anyhow)?;
-            Ok(Some(viewer_id))
-        })
+        let explorer = RDataExplorer::new(name.clone(), obj, Some(binding), DataExplorerMode::Full)
+            .map_err(harp::Error::Anyhow)?;
+        let viewer_id = Console::get_mut()
+            .comm_open_backend(DATA_EXPLORER_COMM_NAME, Box::new(explorer))
+            .map_err(harp::Error::Anyhow)?;
+        Ok(Some(viewer_id))
     }
 
     /// Opens an object explorer on the object at `path`, watching the
@@ -424,98 +306,81 @@ impl RVariables {
         path: &[String],
         query_types: &[String],
     ) -> anyhow::Result<QueryTableSummaryResult> {
-        r_task(|| {
-            let env = self.env.get().clone();
-            let table = PositronVariable::resolve_data_object(env, path)?;
+        let env = self.env.clone();
+        let table = PositronVariable::resolve_data_object(env, path)?;
 
-            let kind = if harp::utils::r_is_data_frame(table.sexp) {
-                harp::TableKind::Dataframe
-            } else if harp::utils::r_is_matrix(table.sexp) {
-                harp::TableKind::Matrix
-            } else {
-                return Err(anyhow!(
-                    "Object is not a supported table type (data.frame or matrix)"
-                ));
-            };
+        let kind = if harp::utils::r_is_data_frame(table.sexp) {
+            harp::TableKind::Dataframe
+        } else if harp::utils::r_is_matrix(table.sexp) {
+            harp::TableKind::Matrix
+        } else {
+            return Err(anyhow!(
+                "Object is not a supported table type (data.frame or matrix)"
+            ));
+        };
 
-            let num_cols = match kind {
-                harp::TableKind::Dataframe => {
-                    let ncol = harp::DataFrame::n_col(table.sexp)?;
-                    ncol as i64
-                },
-                harp::TableKind::Matrix => {
-                    let (_nrow, ncol) = harp::Matrix::dim(table.sexp)?;
-                    ncol as i64
-                },
-            };
+        let num_cols = match kind {
+            harp::TableKind::Dataframe => {
+                let ncol = harp::DataFrame::n_col(table.sexp)?;
+                ncol as i64
+            },
+            harp::TableKind::Matrix => {
+                let (_nrow, ncol) = harp::Matrix::dim(table.sexp)?;
+                ncol as i64
+            },
+        };
 
-            let shapes = RDataExplorer::get_shape(table.clone())?;
+        let shapes = RDataExplorer::get_shape(table.clone())?;
 
-            let column_schemas: Vec<String> = shapes
+        let column_schemas: Vec<String> = shapes
+            .columns
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut column_profiles: Vec<String> = vec![];
+
+        if query_types.contains(&"summary_stats".to_string()) {
+            let profiles: Vec<String> = shapes
                 .columns
                 .iter()
-                .map(serde_json::to_string)
-                .collect::<Result<Vec<_>, _>>()?;
+                .enumerate()
+                .map(|(i, schema)| -> anyhow::Result<String> {
+                    let column = harp::tbl_get_column(table.sexp, i as i32, kind)?;
 
-            let mut column_profiles: Vec<String> = vec![];
+                    let format_options = amalthea::comm::data_explorer_comm::FormatOptions {
+                        large_num_digits: 4,
+                        small_num_digits: 6,
+                        max_integral_digits: 7,
+                        max_value_length: 1000,
+                        thousands_sep: None,
+                    };
 
-            if query_types.contains(&"summary_stats".to_string()) {
-                let profiles: Vec<String> = shapes
-                    .columns
-                    .iter()
-                    .enumerate()
-                    .map(|(i, schema)| -> anyhow::Result<String> {
-                        let column = harp::tbl_get_column(table.sexp, i as i32, kind)?;
+                    let summary_stats =
+                        summary_stats(column.sexp, schema.type_display, &format_options).map(
+                            |stats| serde_json::to_value(stats).unwrap_or(serde_json::Value::Null),
+                        )?;
 
-                        let format_options = amalthea::comm::data_explorer_comm::FormatOptions {
-                            large_num_digits: 4,
-                            small_num_digits: 6,
-                            max_integral_digits: 7,
-                            max_value_length: 1000,
-                            thousands_sep: None,
-                        };
-
-                        let summary_stats =
-                            summary_stats(column.sexp, schema.type_display, &format_options).map(
-                                |stats| {
-                                    serde_json::to_value(stats).unwrap_or(serde_json::Value::Null)
-                                },
-                            )?;
-
-                        let profile = serde_json::json!({
-                            "column_name": schema.column_name,
-                            "type_display": format!("{:?}", schema.type_display).to_lowercase(),
-                            "summary_stats": summary_stats,
-                        })
-                        .to_string();
-
-                        Ok(profile)
+                    let profile = serde_json::json!({
+                        "column_name": schema.column_name,
+                        "type_display": format!("{:?}", schema.type_display).to_lowercase(),
+                        "summary_stats": summary_stats,
                     })
-                    .collect::<anyhow::Result<Vec<String>>>()?;
+                    .to_string();
 
-                column_profiles.extend(profiles);
-            }
+                    Ok(profile)
+                })
+                .collect::<anyhow::Result<Vec<String>>>()?;
 
-            Ok(QueryTableSummaryResult {
-                num_rows: shapes.num_rows as i64,
-                num_columns: num_cols,
-                column_schemas,
-                column_profiles,
-            })
-        })
-    }
-
-    fn send_event(&mut self, message: VariablesFrontendEvent) {
-        let data = serde_json::to_value(message);
-
-        match data {
-            Ok(data) => {
-                self.comm.outgoing_tx.send(CommMsg::Data(data)).log_err();
-            },
-            Err(err) => {
-                log::error!("Variables: Failed to serialize environment data: {err}");
-            },
+            column_profiles.extend(profiles);
         }
+
+        Ok(QueryTableSummaryResult {
+            num_rows: shapes.num_rows as i64,
+            num_columns: num_cols,
+            column_schemas,
+            column_profiles,
+        })
     }
 
     /// Determines whether or not we should be showing the special `.Last.value` object
@@ -534,113 +399,109 @@ impl RVariables {
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
-    fn update(&mut self) {
-        r_task(|| {
-            let needs_initial_refresh = self.needs_initial_refresh;
-            self.needs_initial_refresh = false;
+    fn update(&mut self, ctx: &CommHandlerContext) {
+        let needs_initial_refresh = self.needs_initial_refresh;
+        self.needs_initial_refresh = false;
 
-            let env_changed = self.update_env();
+        let env_changed = self.update_env();
 
-            // Send a full refresh if the environment changed (e.g. entered
-            // or exited debug mode) or on the first update after startup.
-            if env_changed || needs_initial_refresh {
-                self.update_bindings(self.bindings());
+        // Send a full refresh if the environment changed (e.g. entered
+        // or exited debug mode) or on the first update after startup.
+        if env_changed || needs_initial_refresh {
+            self.update_bindings(self.bindings());
 
-                let mut variables: Vec<Variable> = vec![];
+            let mut variables: Vec<Variable> = vec![];
 
-                for binding in self.current_bindings.get() {
-                    variables.push(PositronVariable::new(binding).var());
-                }
-
-                let length = variables.len() as i64;
-                self.send_event(VariablesFrontendEvent::Refresh(RefreshParams {
-                    variables,
-                    length,
-                    version: self.version as i64,
-                }));
-
-                return;
+            for binding in &self.current_bindings {
+                variables.push(PositronVariable::new(binding).var());
             }
 
-            // Incremental update: diff old vs new bindings
-            let mut assigned: Vec<Variable> = vec![];
-            let mut removed: Vec<String> = vec![];
+            let length = variables.len() as i64;
+            ctx.send_event(&VariablesFrontendEvent::Refresh(RefreshParams {
+                variables,
+                length,
+                version: self.version as i64,
+            }));
 
-            let new_bindings = self.bindings();
+            return;
+        }
 
-            let mut old_iter = self.current_bindings.get().iter();
-            let mut old_next = old_iter.next();
+        // Incremental update: diff old vs new bindings
+        let mut assigned: Vec<Variable> = vec![];
+        let mut removed: Vec<String> = vec![];
 
-            let mut new_iter = new_bindings.get().iter();
-            let mut new_next = new_iter.next();
+        let new_bindings = self.bindings();
 
-            loop {
-                match (old_next, new_next) {
-                    // nothing more to do
-                    (None, None) => break,
+        let mut old_iter = self.current_bindings.iter();
+        let mut old_next = old_iter.next();
 
-                    // No more old, collect last new into added
-                    (None, Some(mut new)) => {
-                        loop {
+        let mut new_iter = new_bindings.iter();
+        let mut new_next = new_iter.next();
+
+        loop {
+            match (old_next, new_next) {
+                // nothing more to do
+                (None, None) => break,
+
+                // No more old, collect last new into added
+                (None, Some(mut new)) => {
+                    loop {
+                        assigned.push(PositronVariable::new(new).var());
+
+                        match new_iter.next() {
+                            Some(x) => {
+                                new = x;
+                            },
+                            None => break,
+                        };
+                    }
+                    break;
+                },
+
+                // No more new, collect the last old into removed
+                (Some(mut old), None) => {
+                    loop {
+                        removed.push(old.name.to_string());
+
+                        match old_iter.next() {
+                            Some(x) => {
+                                old = x;
+                            },
+                            None => break,
+                        };
+                    }
+
+                    break;
+                },
+
+                (Some(old), Some(new)) => {
+                    if old.name == new.name {
+                        if old.value.id() != new.value.id() {
                             assigned.push(PositronVariable::new(new).var());
-
-                            match new_iter.next() {
-                                Some(x) => {
-                                    new = x;
-                                },
-                                None => break,
-                            };
                         }
-                        break;
-                    },
-
-                    // No more new, collect the last old into removed
-                    (Some(mut old), None) => {
-                        loop {
-                            removed.push(old.name.to_string());
-
-                            match old_iter.next() {
-                                Some(x) => {
-                                    old = x;
-                                },
-                                None => break,
-                            };
-                        }
-
-                        break;
-                    },
-
-                    (Some(old), Some(new)) => {
-                        if old.name == new.name {
-                            if old.value.id() != new.value.id() {
-                                assigned.push(PositronVariable::new(new).var());
-                            }
-                            old_next = old_iter.next();
-                            new_next = new_iter.next();
-                        } else if old.name < new.name {
-                            removed.push(old.name.to_string());
-                            old_next = old_iter.next();
-                        } else {
-                            assigned.push(PositronVariable::new(new).var());
-                            new_next = new_iter.next();
-                        }
-                    },
-                }
+                        old_next = old_iter.next();
+                        new_next = new_iter.next();
+                    } else if old.name < new.name {
+                        removed.push(old.name.to_string());
+                        old_next = old_iter.next();
+                    } else {
+                        assigned.push(PositronVariable::new(new).var());
+                        new_next = new_iter.next();
+                    }
+                },
             }
+        }
 
-            if !assigned.is_empty() || !removed.is_empty() {
-                self.update_bindings(new_bindings);
-                self.send_event(VariablesFrontendEvent::Update(UpdateParams {
-                    assigned,
-                    removed,
-                    unevaluated: vec![],
-                    version: self.version as i64,
-                }));
-            }
-        });
+        if !assigned.is_empty() || !removed.is_empty() {
+            self.update_bindings(new_bindings);
+            ctx.send_event(&VariablesFrontendEvent::Update(UpdateParams {
+                assigned,
+                removed,
+                unevaluated: vec![],
+                version: self.version as i64,
+            }));
+        }
     }
-
-    // SAFETY: The following methods must be called in an `r_task()`
 
     /// Updates `self.env` to the current effective environment if it changed
     /// (e.g. entering or exiting debug mode). Returns `true` if switched.
@@ -651,16 +512,16 @@ impl RVariables {
 
         let env = console::selected_env();
 
-        if env.sexp == self.env.get().sexp {
+        if env.sexp == self.env.sexp {
             return false;
         }
 
-        self.env = RThreadSafe::new(env);
+        self.env = env;
         true
     }
 
-    fn bindings(&self) -> RThreadSafe<Vec<Binding>> {
-        let env = self.env.get().clone();
+    fn bindings(&self) -> Vec<Binding> {
+        let env = self.env.clone();
         let env = Environment::new_filtered(env, EnvironmentFilter::ExcludeHidden);
 
         let mut bindings: Vec<Binding> = env.iter().filter_map(|b| b.ok()).collect();
@@ -673,6 +534,24 @@ impl RVariables {
 
         bindings.sort_by_key(|a| a.name);
 
-        RThreadSafe::new(bindings)
+        bindings
+    }
+}
+
+pub const VARIABLES_COMM_NAME: &str = "positron.variables";
+
+impl CommHandler for RVariables {
+    fn handle_open(&mut self, ctx: &CommHandlerContext) {
+        self.update(ctx);
+    }
+
+    fn handle_msg(&mut self, msg: CommMsg, ctx: &CommHandlerContext) {
+        handle_rpc_request(&ctx.outgoing_tx, VARIABLES_COMM_NAME, msg, |req| {
+            self.handle_rpc(req, ctx)
+        });
+    }
+
+    fn handle_environment(&mut self, _event: &EnvironmentChanged, ctx: &CommHandlerContext) {
+        self.update(ctx);
     }
 }

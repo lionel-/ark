@@ -82,12 +82,6 @@ pub struct DummyArkFrontend {
     ignore_ui_busy: Cell<bool>,
     /// Comm ID of the open variables comm, if any.
     variables_comm_id: RefCell<Option<String>>,
-    /// Buffered variables comm events, auto-collected by `recv_iopub_next()`.
-    /// Buffering is needed because variables events can race with Idle on
-    /// IOPub. Once variables are migrated to the blocking `CommHandler` path
-    /// (https://github.com/posit-dev/ark/issues/689), we should be able to
-    /// assert these deterministically in the message sequence instead.
-    variables_events: RefCell<VecDeque<VariablesFrontendEvent>>,
 }
 
 /// Stream messages captured by `drain_streams()`, preserving wire order.
@@ -245,7 +239,6 @@ impl DummyArkFrontend {
             ui_comm_id: RefCell::new(None),
             ignore_ui_busy: Cell::new(true),
             variables_comm_id: RefCell::new(None),
-            variables_events: RefCell::new(VecDeque::new()),
         }
     }
 
@@ -272,11 +265,10 @@ impl DummyArkFrontend {
         }
     }
 
-    /// Core primitive: receive the next non-stream, non-variables-comm message
-    /// from IOPub.
+    /// Core primitive: receive the next non-stream message from IOPub.
     ///
-    /// This automatically buffers any Stream messages and variables comm
-    /// messages encountered while waiting. All `recv_iopub_*` methods for
+    /// This automatically buffers any Stream messages encountered while waiting.
+    /// All `recv_iopub_*` methods for
     /// non-stream messages should use this instead of calling `recv_iopub()`
     /// directly.
     fn recv_iopub_next(&self) -> Message {
@@ -295,11 +287,8 @@ impl DummyArkFrontend {
         }
     }
 
-    /// Try to buffer a known message (stream, UI comm refresh, or variables comm).
+    /// Try to buffer a stream or skip an ignored UI busy event.
     /// Traces the message if it was buffered. Returns `true` if the message was consumed.
-    ///
-    /// Variables comm events still race with Idle (not yet migrated to
-    /// blocking `CommHandler` path).
     fn try_buffer_msg(&self, msg: &Message) -> bool {
         match msg {
             Message::Stream(ref data) => {
@@ -313,11 +302,6 @@ impl DummyArkFrontend {
                     data.content.data.get("method").and_then(|v| v.as_str()) == Some("busy") =>
             {
                 trace_iopub_msg(msg);
-                true
-            },
-            Message::CommMsg(ref data) if self.is_variables_comm(&data.content.comm_id) => {
-                trace_iopub_msg(msg);
-                self.buffer_variables_event(&data.content.data);
                 true
             },
             _ => false,
@@ -379,11 +363,6 @@ impl DummyArkFrontend {
             .borrow()
             .as_deref()
             .is_some_and(|id| id == comm_id)
-    }
-
-    fn buffer_variables_event(&self, data: &serde_json::Value) {
-        let event: VariablesFrontendEvent = serde_json::from_value(data.clone()).unwrap();
-        self.variables_events.borrow_mut().push_back(event);
     }
 
     /// Internal helper for stream assertions.
@@ -937,11 +916,10 @@ impl DummyArkFrontend {
 
     /// Open a `positron.variables` comm via the Shell socket.
     ///
-    /// Returns the initial `RefreshParams` from the variables pane.
-    /// After this call, variables comm messages are automatically buffered
-    /// by `recv_iopub_next()` (parallel to how Stream messages are handled).
+    /// Returns the comm ID and initial `RefreshParams` from the variables pane.
+    /// Variables events must be consumed in wire order, before Idle.
     #[track_caller]
-    pub fn open_variables_comm(&self) -> RefreshParams {
+    pub fn open_variables_comm(&self) -> (String, RefreshParams) {
         debug_assert!(
             self.variables_comm_id.borrow().is_none(),
             "Variables comm already open"
@@ -956,20 +934,14 @@ impl DummyArkFrontend {
             data: serde_json::json!({}),
         });
 
-        // Busy + Idle from the comm_open handler. The initial Refresh from
-        // the variables thread may arrive interleaved or shortly after;
-        // `recv_iopub_next()` auto-buffers it.
         self.recv_iopub_busy();
+        let refresh = self.recv_variables_refresh();
         self.recv_iopub_idle();
 
-        // The initial Refresh may already be buffered, or we need to wait.
-        self.recv_variables_refresh()
+        (comm_id, refresh)
     }
 
     /// Wait for the next variables `Refresh` event.
-    ///
-    /// Checks the internal buffer first (populated by `recv_iopub_next()`),
-    /// then reads more IOPub messages if needed.
     #[track_caller]
     pub fn recv_variables_refresh(&self) -> RefreshParams {
         match self.recv_variables_event() {
@@ -979,9 +951,6 @@ impl DummyArkFrontend {
     }
 
     /// Wait for the next variables `Update` event.
-    ///
-    /// Checks the internal buffer first (populated by `recv_iopub_next()`),
-    /// then reads more IOPub messages if needed.
     #[track_caller]
     pub fn recv_variables_update(&self) -> UpdateParams {
         match self.recv_variables_event() {
@@ -991,43 +960,14 @@ impl DummyArkFrontend {
     }
 
     /// Wait for the next variables comm event (Refresh or Update).
-    /// This polling loop exists because variables events can race with Idle
-    /// on IOPub. Once https://github.com/posit-dev/ark/issues/689 is
-    /// resolved, this can be replaced by a direct `recv_iopub_next()` call.
     #[track_caller]
     fn recv_variables_event(&self) -> VariablesFrontendEvent {
-        // Check buffer first
-        if let Some(event) = self.variables_events.borrow_mut().pop_front() {
-            return event;
-        }
-
-        // Read more IOPub messages until we get a variables event
-        let deadline = Instant::now() + RECV_TIMEOUT;
-        loop {
-            if Instant::now() >= deadline {
-                panic!("Timeout waiting for variables comm event");
-            }
-
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let poll_timeout = remaining.min(Duration::from_millis(100));
-
-            if let Some(msg) = self.recv_iopub_with_timeout(poll_timeout) {
-                if self.try_buffer_msg(&msg) {
-                    if let Some(event) = self.variables_events.borrow_mut().pop_front() {
-                        return event;
-                    }
-                    continue;
-                }
-                // Idle can race with variables events (see #689)
-                match msg {
-                    Message::Status(_) => {
-                        self.pending_iopub_messages.borrow_mut().push_back(msg);
-                    },
-                    other => {
-                        panic!("Unexpected message while waiting for variables event: {other:?}")
-                    },
-                }
-            }
+        match self.recv_iopub_next() {
+            Message::CommMsg(data) => {
+                assert!(self.is_variables_comm(&data.content.comm_id));
+                serde_json::from_value(data.content.data).unwrap()
+            },
+            other => panic!("Expected variables CommMsg, got {other:?}"),
         }
     }
 
@@ -1720,7 +1660,7 @@ impl DummyArkFrontend {
     ///
     /// Returns the collected messages in the order they were received.
     ///
-    /// Streams and variables comm messages are auto-buffered (same as
+    /// Streams are auto-buffered (same as
     /// `recv_iopub_next`). Stream buffers are cleared at the end without
     /// requiring explicit assertions, since the interleaved window typically
     /// spans multiple busy/idle cycles.
@@ -2017,17 +1957,6 @@ impl Drop for DummyArkFrontend {
                 drained.stderr()
             );
         }
-
-        // Fail if variables events were buffered but never consumed
-        let buffered_variables = self.variables_events.borrow();
-        if !buffered_variables.is_empty() {
-            panic!(
-                "Test has {} unconsumed variables event(s): {:?}",
-                buffered_variables.len(),
-                *buffered_variables
-            );
-        }
-        drop(buffered_variables);
 
         // Helper to check if a message is exempt from "unexpected message" check
         let is_exempt = |msg: &Message| -> bool {

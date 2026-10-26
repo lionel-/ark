@@ -55,6 +55,7 @@ use crate::request::RRequest;
 use crate::ui::UiComm;
 use crate::ui::UI_COMM_NAME;
 use crate::variables::r_variables::RVariables;
+use crate::variables::r_variables::VARIABLES_COMM_NAME;
 
 pub struct Shell {
     r_request_tx: Sender<RRequest>,
@@ -250,7 +251,7 @@ impl ShellHandler for Shell {
         data: serde_json::Value,
     ) -> amalthea::Result<(bool, Option<Receiver<()>>)> {
         match target {
-            Comm::Variables => Ok((handle_comm_open_variables(comm)?, None)),
+            Comm::Variables => handle_comm_open_variables(comm, self.kernel_request_tx.clone()),
             Comm::Ui => handle_comm_open_ui(comm, self.kernel_request_tx.clone(), data),
             Comm::Help => handle_comm_open_help(comm, self.kernel_request_tx.clone()),
             Comm::Other(target_name) if target_name == "ark" => {
@@ -272,7 +273,8 @@ impl ShellHandler for Shell {
             HELP_COMM_NAME |
             OBJECT_EXPLORER_COMM_NAME |
             PLOT_COMM_NAME |
-            UI_COMM_NAME => {
+            UI_COMM_NAME |
+            VARIABLES_COMM_NAME => {
                 let done_rx = self.start_kernel_request(|done_tx| KernelRequest::CommMsg {
                     comm_id: comm_id.to_string(),
                     msg,
@@ -295,7 +297,8 @@ impl ShellHandler for Shell {
             HELP_COMM_NAME |
             OBJECT_EXPLORER_COMM_NAME |
             PLOT_COMM_NAME |
-            UI_COMM_NAME => {
+            UI_COMM_NAME |
+            VARIABLES_COMM_NAME => {
                 let done_rx = self.start_kernel_request(|done_tx| KernelRequest::CommClose {
                     comm_id: comm_id.to_string(),
                     done_tx,
@@ -323,12 +326,23 @@ impl Shell {
     }
 }
 
-fn handle_comm_open_variables(comm: CommSocket) -> amalthea::Result<bool> {
-    r_task(|| {
-        let global_env = RObject::view(R_ENVS.global);
-        RVariables::start(global_env, comm);
-        Ok(true)
-    })
+fn handle_comm_open_variables(
+    comm: CommSocket,
+    kernel_request_tx: Sender<KernelRequest>,
+) -> amalthea::Result<(bool, Option<Receiver<()>>)> {
+    let (done_tx, done_rx) = bounded(0);
+    kernel_request_tx
+        .send(KernelRequest::CommOpen {
+            comm_id: comm.comm_id.clone(),
+            comm_name: comm.comm_name.clone(),
+            outgoing_tx: comm.outgoing_tx.clone(),
+            new_handler: |_| Box::new(RVariables::new(RObject::view(R_ENVS.global))),
+            data: json!({}),
+            done_tx,
+        })
+        .map_err(|err| amalthea::Error::SendError(err.to_string()))?;
+
+    Ok((true, Some(done_rx)))
 }
 
 fn handle_comm_open_ui(
@@ -336,15 +350,14 @@ fn handle_comm_open_ui(
     kernel_request_tx: Sender<KernelRequest>,
     data: serde_json::Value,
 ) -> amalthea::Result<(bool, Option<Receiver<()>>)> {
-    let handler = UiComm::new(data);
-
     let (done_tx, done_rx) = bounded(0);
     kernel_request_tx
         .send(KernelRequest::CommOpen {
             comm_id: comm.comm_id.clone(),
             comm_name: comm.comm_name.clone(),
             outgoing_tx: comm.outgoing_tx.clone(),
-            handler: Box::new(handler),
+            new_handler: |data| Box::new(UiComm::new(data)),
+            data,
             done_tx,
         })
         .map_err(|err| amalthea::Error::SendError(err.to_string()))?;
@@ -366,7 +379,8 @@ fn handle_comm_open_help(
             comm_id: comm.comm_id.clone(),
             comm_name: comm.comm_name.clone(),
             outgoing_tx: comm.outgoing_tx.clone(),
-            handler: Box::new(RHelp::default()),
+            new_handler: |_| Box::new(RHelp::default()),
+            data: json!({}),
             done_tx,
         })
         .map_err(|err| amalthea::Error::SendError(err.to_string()))?;

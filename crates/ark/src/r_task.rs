@@ -438,14 +438,6 @@ impl RTask {
         RTask::IdleAnyPrompt(Box::pin(fun()))
     }
 
-    pub(crate) fn send_idle<F, Fut>(fun: F) -> Self
-    where
-        F: FnOnce(ConsoleOutputCapture) -> Fut + 'static + Send,
-        Fut: Future<Output = ()> + 'static,
-    {
-        RTask::SendIdle(Self::pin_with_capture(fun))
-    }
-
     /// For rare performance sensitive cases where you'd like to avoid the cost of
     /// poking R options via [Self::pin_with_capture()] and you know you don't need
     /// the safety of capturing output because you aren't running R code

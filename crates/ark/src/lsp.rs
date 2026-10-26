@@ -18,7 +18,6 @@ mod declarations;
 pub mod diagnostics;
 pub mod diagnostics_syntax;
 pub mod document_context;
-pub mod events;
 pub mod folding_range;
 pub mod goto_definition;
 pub mod handler;
